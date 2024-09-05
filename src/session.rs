@@ -10,6 +10,7 @@ use log::{info, warn};
 use nix::unistd::geteuid;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::{io, ops::DerefMut};
@@ -61,7 +62,7 @@ pub struct Session<FS: Filesystem> {
     /// True if the filesystem is initialized (init operation done)
     pub(crate) initialized: bool,
     /// True if the filesystem was destroyed (destroy operation done)
-    pub(crate) destroyed: bool,
+    pub(crate) destroyed: Arc<AtomicBool>,
 }
 
 impl<FS: Filesystem> Session<FS> {
@@ -73,6 +74,7 @@ impl<FS: Filesystem> Session<FS> {
     ) -> io::Result<Session<FS>> {
         let mountpoint = mountpoint.as_ref();
         info!("Mounting {}", mountpoint.display());
+        let destroyed = Arc::new(AtomicBool::new(false));
         // If AutoUnmount is requested, but not AllowRoot or AllowOther we enforce the ACL
         // ourself and implicitly set AllowOther because fusermount needs allow_root or allow_other
         // to handle the auto_unmount option
@@ -83,9 +85,9 @@ impl<FS: Filesystem> Session<FS> {
             warn!("Given auto_unmount without allow_root or allow_other; adding allow_other, with userspace permission handling");
             let mut modified_options = options.to_vec();
             modified_options.push(MountOption::AllowOther);
-            Mount::new(mountpoint, &modified_options)?
+            Mount::new(mountpoint, &modified_options, destroyed.clone())?
         } else {
-            Mount::new(mountpoint, options)?
+            Mount::new(mountpoint, options, destroyed.clone())?
         };
 
         let ch = Channel::new(file);
@@ -107,7 +109,7 @@ impl<FS: Filesystem> Session<FS> {
             proto_major: 0,
             proto_minor: 0,
             initialized: false,
-            destroyed: false,
+            destroyed,
         })
     }
 
@@ -172,6 +174,10 @@ impl<FS: Filesystem> Session<FS> {
     pub fn notifier(&self) -> Notifier {
         Notifier::new(self.ch.sender())
     }
+
+    pub(crate) fn destroyed(&self) -> bool {
+        self.destroyed.load(Ordering::Relaxed)
+    }
 }
 
 #[derive(Debug)]
@@ -206,9 +212,9 @@ impl<FS: 'static + Filesystem + Send> Session<FS> {
 
 impl<FS: Filesystem> Drop for Session<FS> {
     fn drop(&mut self) {
-        if !self.destroyed {
+        if !self.destroyed() {
             self.filesystem.destroy();
-            self.destroyed = true;
+            self.destroyed.store(true, Ordering::Relaxed);
         }
         info!("Unmounted {}", self.mountpoint().display());
     }
